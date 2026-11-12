@@ -214,7 +214,7 @@ class IslandListener : NotificationListenerService() {
     override fun onNotificationRemoved(sbn: StatusBarNotification) {
         h.post {
             stickies.remove(sbn.key)
-            if (currentKey == sbn.key) dismiss()
+            if (currentKey == sbn.key) dismiss() else refreshIdle()
         }
     }
 
@@ -223,7 +223,7 @@ class IslandListener : NotificationListenerService() {
         val t = c.sessionToken
         if (ctrls.containsKey(t)) return
         val cb = object : MediaController.Callback() {
-            override fun onMetadataChanged(m: MediaMetadata?) { onMedia(c) }
+            override fun onMetadataChanged(m: MediaMetadata?) { onMedia(c); refreshIdle() }
             override fun onPlaybackStateChanged(s: PlaybackState?) { onMedia(c); refreshIdle() }
         }
         c.registerCallback(cb, h)
@@ -253,17 +253,32 @@ class IslandListener : NotificationListenerService() {
         h.postDelayed(r, 350)
     }
 
-    private fun showMedia(c: MediaController): Boolean {
-        val md = c.metadata ?: return false
-        val title = md.getString(MediaMetadata.METADATA_KEY_TITLE) ?: md.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE) ?: return false
+    private fun mediaCard(c: MediaController): Card? {
+        val md = c.metadata ?: return null
+        val title = md.getString(MediaMetadata.METADATA_KEY_TITLE) ?: md.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE) ?: return null
         val artist = md.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: md.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST)
             ?: md.getString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE) ?: ""
         val bmp = md.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART) ?: md.getBitmap(MediaMetadata.METADATA_KEY_ART)
             ?: md.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
         val art: Drawable? = bmp?.let { BitmapDrawable(resources, it) }
-        present(Card("media", "NOW PLAYING", title, artist, art, c.sessionActivity, mc = c), false)
+        return Card("media", "NOW PLAYING", title, artist, art, c.sessionActivity, mc = c)
+    }
+
+    private fun showMedia(c: MediaController): Boolean {
+        val card = mediaCard(c) ?: return false
+        present(card, false)
         return true
     }
+
+    /** What the always-visible pill should show: a call/timer, or the song that is playing */
+    private fun liveCard(): Card? {
+        stickies.values.lastOrNull()?.let { return it }
+        if (!Prefs.on(this, "media")) return null
+        val c = ctrls.values.map { it.first }.firstOrNull { isPlaying(it) } ?: return null
+        return mediaCard(c)
+    }
+
+    private fun restW() = dp(Prefs.int(this, if (liveCard() != null) "liveW" else "idleW"))
 
     fun testMedia(): Boolean {
         val all = ctrls.values.map { it.first }
@@ -287,23 +302,24 @@ class IslandListener : NotificationListenerService() {
         removeIdle(); removeNow()
         currentKey = card.key; expanded = exp
         val accent = Prefs.accent(this); val fg = Prefs.fg(this)
-        val dim = Prefs.dim(this); val off = Prefs.off(this); val edge = Prefs.edge(this)
+        val dim = Prefs.dim(this); val off = Prefs.off(this)
         if (card.tintIcon) card.icon?.mutate()?.setTint(fg)
         if (!exp) tick()
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(10), dp(16), dp(10))
-            background = pillBg(34)
+            // content sits below the camera, like a real dynamic island
+            setPadding(dp(18), dp(Prefs.int(this@IslandListener, "idleH")) + dp(4), dp(18), dp(14))
+            background = pillBg(30)
         }
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         card.icon?.let { ic ->
             row.addView(ImageView(this).apply {
                 setImageDrawable(ic); scaleType = ImageView.ScaleType.CENTER_CROP
-                background = GradientDrawable().apply { setColor(Prefs.surface(this@IslandListener)); cornerRadius = dp(9).toFloat() }
+                background = GradientDrawable().apply { setColor(Prefs.surface(this@IslandListener)); cornerRadius = dp(10).toFloat() }
                 clipToOutline = true
-                if (card.tintIcon) setPadding(dp(5), dp(5), dp(5), dp(5))
-            }, LinearLayout.LayoutParams(dp(32), dp(32)).apply { marginEnd = dp(12) })
+                if (card.tintIcon) setPadding(dp(6), dp(6), dp(6), dp(6))
+            }, LinearLayout.LayoutParams(dp(38), dp(38)).apply { marginEnd = dp(12) })
         }
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         if (card.tag.isNotEmpty()) col.addView(tv(card.tag, 10f, accent, 1))
@@ -369,19 +385,35 @@ class IslandListener : NotificationListenerService() {
             action(ctl, ">>") { mc.transportControls.skipToNext() }
             root.addView(ctl)
         } else if (exp && !plain) {
-            root.addView(View(this).apply { setBackgroundColor(edge) },
-                LinearLayout.LayoutParams(-1, dp(1)).apply { topMargin = dp(10) })
             val ctl = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
             action(ctl, "OPEN") { try { card.pi?.send() } catch (e: Exception) {}; if (!card.sticky) dismiss() }
             action(ctl, "CLOSE") { stickies.remove(card.key); dismiss() }
             root.addView(ctl)
         }
 
+        attachGestures(root, card)
+
+        // start tiny so nothing flashes, then grow out of the small pill (no fading, stays solid black)
+        val startW = restW().toFloat()
+        root.scaleX = 0.01f; root.scaleY = 0.01f
+        wm().addView(root, params(dp(Prefs.int(this, "width")), WindowManager.LayoutParams.WRAP_CONTENT, true))
+        view = root
+        root.post {
+            root.pivotX = root.width / 2f; root.pivotY = 0f
+            root.scaleX = startW / root.width.coerceAtLeast(1)
+            root.scaleY = dp(Prefs.int(this, "idleH")).toFloat() / root.height.coerceAtLeast(1)
+            root.animate().scaleX(1f).scaleY(1f).setDuration(450)
+                .setInterpolator(OvershootInterpolator(0.9f)).start()
+        }
+        h.postDelayed(dismissRun, if (exp) 8000L else Prefs.int(this, "secs") * 1000L)
+    }
+
+    private fun attachGestures(v: View, card: Card) {
         val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean = true
             override fun onSingleTapUp(e: MotionEvent): Boolean {
                 try { card.pi?.send() } catch (ex: Exception) {}
-                if (!card.sticky) dismiss()
+                if (view != null && !card.sticky) dismiss()
                 return true
             }
             override fun onLongPress(e: MotionEvent) { tick(); h.post { present(card, true) } }
@@ -391,24 +423,15 @@ class IslandListener : NotificationListenerService() {
                     if (vx < 0) m.transportControls.skipToNext() else m.transportControls.skipToPrevious()
                     tick(); return true
                 }
-                if (vy < -400f) { stickies.remove(card.key); dismiss(); return true }
+                if (vy < -400f) {
+                    stickies.remove(card.key)
+                    if (view != null) dismiss() else refreshIdle()
+                    return true
+                }
                 return false
             }
         })
-        root.setOnTouchListener { _, ev -> gd.onTouchEvent(ev) }
-
-        // start tiny so nothing flashes, then grow out of the small pill (no fading, stays solid black)
-        root.scaleX = 0.01f; root.scaleY = 0.01f
-        wm().addView(root, params(dp(Prefs.int(this, "width")), WindowManager.LayoutParams.WRAP_CONTENT, true))
-        view = root
-        root.post {
-            root.pivotX = root.width / 2f; root.pivotY = 0f
-            root.scaleX = dp(Prefs.int(this, "idleW")).toFloat() / root.width.coerceAtLeast(1)
-            root.scaleY = dp(Prefs.int(this, "idleH")).toFloat() / root.height.coerceAtLeast(1)
-            root.animate().scaleX(1f).scaleY(1f).setDuration(450)
-                .setInterpolator(OvershootInterpolator(0.9f)).start()
-        }
-        if (!card.sticky || exp) h.postDelayed(dismissRun, if (exp) 8000L else Prefs.int(this, "secs") * 1000L)
+        v.setOnTouchListener { _, ev -> gd.onTouchEvent(ev) }
     }
 
     private fun stopTick() { tickRun?.let { h.removeCallbacks(it) }; tickRun = null }
@@ -424,7 +447,7 @@ class IslandListener : NotificationListenerService() {
         val v = view
         view = null; currentKey = ""; expanded = false
         if (v == null) { restore(); return }
-        val sx = dp(Prefs.int(this, "idleW")).toFloat() / v.width.coerceAtLeast(1)
+        val sx = restW().toFloat() / v.width.coerceAtLeast(1)
         val sy = dp(Prefs.int(this, "idleH")).toFloat() / v.height.coerceAtLeast(1)
         val keepSolid = Prefs.on(this, "idle")
         v.animate().scaleX(sx).scaleY(sy).alpha(if (keepSolid) 1f else 0f).setDuration(260).withEndAction {
@@ -433,10 +456,7 @@ class IslandListener : NotificationListenerService() {
         }.start()
     }
 
-    private fun restore() {
-        val c = stickies.values.lastOrNull()
-        if (c != null) present(c, false) else showIdle()
-    }
+    private fun restore() { showIdle() }
 
     // ---------- always-on small pill ----------
     fun refreshIdle() { h.post { removeIdle(); if (view == null) showIdle() } }
@@ -451,18 +471,38 @@ class IslandListener : NotificationListenerService() {
         if (idle != null || view != null) return
         if (!Prefs.on(this, "idle") || !Settings.canDrawOverlays(this)) return
         val accent = Prefs.accent(this)
-        val playing = Prefs.on(this, "media") && ctrls.values.any { isPlaying(it.first) }
-        val dot: View = if (playing) DotEq(this, accent) else View(this).apply { background = circle(accent) }
-        val dsz = if (playing) dp(16) else dp(6)
-        val pill = FrameLayout(this).apply {
-            background = pillBg(40)
-            addView(dot, FrameLayout.LayoutParams(dsz, dsz, Gravity.END or Gravity.CENTER_VERTICAL).apply { marginEnd = dp(10) })
+        val live = liveCard()
+        val hgt = dp(Prefs.int(this, "idleH"))
+        val isz = hgt - dp(10)
+        val pill = FrameLayout(this).apply { background = pillBg(40) }
+        if (live != null) {
+            // wider pill: icon on the left, indicator on the right, camera sits in the gap
+            if (live.tintIcon) live.icon?.mutate()?.setTint(Prefs.fg(this))
+            live.icon?.let { ic ->
+                pill.addView(ImageView(this).apply {
+                    setImageDrawable(ic); scaleType = ImageView.ScaleType.CENTER_CROP
+                    background = GradientDrawable().apply { setColor(Prefs.surface(this@IslandListener)); cornerRadius = dp(7).toFloat() }
+                    clipToOutline = true
+                    if (live.tintIcon) setPadding(dp(3), dp(3), dp(3), dp(3))
+                }, FrameLayout.LayoutParams(isz, isz, Gravity.START or Gravity.CENTER_VERTICAL).apply { marginStart = dp(9) })
+            }
+            if (live.mc != null) {
+                pill.addView(DotEq(this, accent), FrameLayout.LayoutParams(isz, isz, Gravity.END or Gravity.CENTER_VERTICAL).apply { marginEnd = dp(10) })
+            } else {
+                pill.addView(tv(live.tag, 9f, accent, 1),
+                    FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL).apply { marginEnd = dp(12) })
+            }
+            attachGestures(pill, live)
+        } else if (Prefs.flag(this, "dot", true)) {
+            val dot = View(this).apply { background = circle(accent) }
+            pill.addView(dot, FrameLayout.LayoutParams(dp(6), dp(6), Gravity.END or Gravity.CENTER_VERTICAL).apply { marginEnd = dp(10) })
+            idleAnim = ObjectAnimator.ofFloat(dot, "alpha", 1f, 0.25f).apply {
+                duration = 1400; repeatMode = ValueAnimator.REVERSE; repeatCount = ValueAnimator.INFINITE; start()
+            }
         }
-        if (!playing) idleAnim = ObjectAnimator.ofFloat(dot, "alpha", 1f, 0.25f).apply {
-            duration = 1400; repeatMode = ValueAnimator.REVERSE; repeatCount = ValueAnimator.INFINITE; start()
-        }
+        val w = dp(Prefs.int(this, if (live != null) "liveW" else "idleW"))
         try {
-            wm().addView(pill, params(dp(Prefs.int(this, "idleW")), dp(Prefs.int(this, "idleH")), false))
+            wm().addView(pill, params(w, hgt, live != null))
             idle = pill
         } catch (e: Exception) { idleAnim?.cancel(); idleAnim = null }
     }
