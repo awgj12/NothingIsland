@@ -81,6 +81,16 @@ class DotEq(c: Context, private val tint: Int) : View(c) {
     }
 }
 
+/** Black background that takes the size of its parent but never makes the parent bigger */
+class Fill(c: Context) : View(c) {
+    override fun onMeasure(w: Int, h: Int) {
+        setMeasuredDimension(
+            if (MeasureSpec.getMode(w) == MeasureSpec.EXACTLY) MeasureSpec.getSize(w) else 0,
+            if (MeasureSpec.getMode(h) == MeasureSpec.EXACTLY) MeasureSpec.getSize(h) else 0
+        )
+    }
+}
+
 class IslandListener : NotificationListenerService() {
     private val h = Handler(Looper.getMainLooper())
     private var view: View? = null
@@ -215,6 +225,7 @@ class IslandListener : NotificationListenerService() {
         }
         if ((n.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return   // its children are shown on their own
 
+        if (pkg == "android" && (n.flags and Notification.FLAG_ONGOING_EVENT) != 0) return
         rememberApp(pkg)
         if (pkg in Prefs.muted(this)) return
         val special = when (n.category) {
@@ -446,7 +457,7 @@ class IslandListener : NotificationListenerService() {
         }
 
         // solid black shape (scales out of the pill) + content that fades in on top of it
-        val bgView = View(this).apply { background = pillBg(Prefs.int(this@IslandListener, "radius")) }
+        val bgView = Fill(this).apply { background = pillBg(Prefs.int(this@IslandListener, "radius")) }
         val box = FrameLayout(this)
         box.addView(bgView, FrameLayout.LayoutParams(-1, -1))
         box.addView(content, FrameLayout.LayoutParams(-1, -2))
