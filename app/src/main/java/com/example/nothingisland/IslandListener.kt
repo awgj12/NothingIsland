@@ -104,7 +104,7 @@ class IslandListener : NotificationListenerService() {
 
     private fun params(w: Int, hgt: Int, touchable: Boolean): WindowManager.LayoutParams {
         var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
         if (!touchable) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
         return WindowManager.LayoutParams(w, hgt, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, flags, PixelFormat.TRANSLUCENT).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
@@ -118,7 +118,7 @@ class IslandListener : NotificationListenerService() {
     private val sessCb = MediaSessionManager.OnActiveSessionsChangedListener { attach(it) }
     private val mcb = object : MediaController.Callback() {
         override fun onMetadataChanged(m: MediaMetadata?) { maybeShowMedia() }
-        override fun onPlaybackStateChanged(s: PlaybackState?) { maybeShowMedia() }
+        override fun onPlaybackStateChanged(s: PlaybackState?) { maybeShowMedia(); refreshIdle() }
     }
     private val powerRx = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
@@ -325,11 +325,16 @@ class IslandListener : NotificationListenerService() {
         wm().addView(root, params(dp(Prefs.int(this, "width")), WindowManager.LayoutParams.WRAP_CONTENT, true))
         view = root
 
-        root.pivotY = 0f
-        root.scaleX = 0.25f; root.scaleY = 0.5f; root.alpha = 0f
-        root.post { root.pivotX = root.width / 2f }
-        root.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(420)
-            .setInterpolator(OvershootInterpolator(1.1f)).start()
+        // grow out of the small pill like a real dynamic island
+        root.alpha = 0f
+        root.post {
+            root.pivotX = root.width / 2f; root.pivotY = 0f
+            root.scaleX = dp(Prefs.int(this, "idleW")).toFloat() / root.width.coerceAtLeast(1)
+            root.scaleY = dp(Prefs.int(this, "idleH")).toFloat() / root.height.coerceAtLeast(1)
+            root.alpha = 0.4f
+            root.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(450)
+                .setInterpolator(OvershootInterpolator(0.9f)).start()
+        }
         if (!card.sticky || exp) h.postDelayed(dismissRun, if (exp) 8000L else Prefs.int(this, "secs") * 1000L)
     }
 
@@ -346,7 +351,9 @@ class IslandListener : NotificationListenerService() {
         val v = view
         view = null; currentKey = ""; expanded = false
         if (v == null) { restore(); return }
-        v.animate().scaleX(0.25f).scaleY(0.5f).alpha(0f).setDuration(200).withEndAction {
+        val sx = dp(Prefs.int(this, "idleW")).toFloat() / v.width.coerceAtLeast(1)
+        val sy = dp(Prefs.int(this, "idleH")).toFloat() / v.height.coerceAtLeast(1)
+        v.animate().scaleX(sx).scaleY(sy).alpha(0f).setDuration(260).withEndAction {
             try { wm().removeView(v) } catch (e: Exception) {}
             if (view == null) restore()
         }.start()
@@ -369,15 +376,18 @@ class IslandListener : NotificationListenerService() {
     private fun showIdle() {
         if (idle != null || view != null) return
         if (!Prefs.on(this, "idle") || !Settings.canDrawOverlays(this)) return
-        val dot = View(this).apply { background = circle(Prefs.accent(this@IslandListener)) }
+        val accent = Prefs.accent(this)
+        val playing = Prefs.on(this, "media") && controller?.playbackState?.state == PlaybackState.STATE_PLAYING
+        val dot: View = if (playing) DotEq(this, accent) else View(this).apply { background = circle(accent) }
+        val dsz = if (playing) dp(16) else dp(6)
         val pill = FrameLayout(this).apply {
             background = GradientDrawable().apply {
                 setColor(Prefs.bg(this@IslandListener)); cornerRadius = dp(40).toFloat()
                 setStroke(dp(1), Prefs.edge(this@IslandListener))
             }
-            addView(dot, FrameLayout.LayoutParams(dp(6), dp(6), Gravity.END or Gravity.CENTER_VERTICAL).apply { marginEnd = dp(10) })
+            addView(dot, FrameLayout.LayoutParams(dsz, dsz, Gravity.END or Gravity.CENTER_VERTICAL).apply { marginEnd = dp(10) })
         }
-        idleAnim = ObjectAnimator.ofFloat(dot, "alpha", 1f, 0.25f).apply {
+        if (!playing) idleAnim = ObjectAnimator.ofFloat(dot, "alpha", 1f, 0.25f).apply {
             duration = 1400; repeatMode = ValueAnimator.REVERSE; repeatCount = ValueAnimator.INFINITE; start()
         }
         try {

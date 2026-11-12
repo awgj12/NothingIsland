@@ -6,7 +6,7 @@ import android.graphics.Typeface
 import androidx.core.content.res.ResourcesCompat
 
 object Prefs {
-    private val D = mapOf("width" to 300, "idleW" to 90, "idleH" to 24, "posX" to 0, "posY" to 8, "secs" to 4)
+    private val D = mapOf("width" to 300, "idleW" to 90, "idleH" to 24, "posX" to 0, "posY" to 0, "secs" to 4)
     fun sp(c: Context) = c.getSharedPreferences("island", Context.MODE_PRIVATE)
     fun int(c: Context, k: String) = sp(c).getInt(k, D[k] ?: 0)
     fun on(c: Context, k: String) = sp(c).getBoolean(k, true)

@@ -8,7 +8,10 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
+import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
@@ -41,7 +44,7 @@ class MainActivity : Activity() {
         background = GradientDrawable().apply { setColor(surface); cornerRadius = dp(22).toFloat() }
     }.also { col.addView(it, LinearLayout.LayoutParams(-1, -2)) }
 
-    private fun btn(p: LinearLayout, t: String, primary: Boolean = false, weight: Float = 0f, onClick: () -> Unit) {
+    private fun btn(p: LinearLayout, t: String, primary: Boolean = false, weight: Float = 0f, onClick: () -> Unit): Button {
         val b = Button(this).apply {
             text = t; typeface = f; setTextColor(Color.WHITE); isAllCaps = false; stateListAnimator = null
             background = GradientDrawable().apply {
@@ -53,6 +56,26 @@ class MainActivity : Activity() {
         val lp = if (weight > 0f) LinearLayout.LayoutParams(0, -2, weight) else LinearLayout.LayoutParams(-1, -2)
         lp.setMargins(dp(3), dp(4), dp(3), dp(4))
         p.addView(b, lp)
+        return b
+    }
+
+    private val hh = Handler(Looper.getMainLooper())
+
+    /** Button that keeps repeating while you hold it */
+    private fun holdBtn(p: LinearLayout, t: String, act: () -> Unit) {
+        val b = btn(p, t, false, 1f) {}
+        var rep: Runnable? = null
+        b.setOnTouchListener { _, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    act()
+                    val r = object : Runnable { override fun run() { act(); hh.postDelayed(this, 50) } }
+                    rep = r; hh.postDelayed(r, 350)
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { rep?.let { hh.removeCallbacks(it) }; rep = null }
+            }
+            true
+        }
     }
 
     private fun slider(p: LinearLayout, name: String, key: String, min: Int, max: Int, unit: String) {
@@ -127,6 +150,7 @@ class MainActivity : Activity() {
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
         }
         btn(g1, "ALLOW NOTIFICATION ACCESS", true) { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }
+        btn(g1, "KEEP RUNNING (BATTERY)") { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
         val tr = row()
         btn(tr, "TEST", false, 1f) { testIsland(false) }
         btn(tr, "TEST EXPANDED", false, 1f) { testIsland(true) }
@@ -134,19 +158,19 @@ class MainActivity : Activity() {
 
         section("Position")
         val g2 = group()
-        g2.addView(label("Move the pill with the arrows until it sits on your camera.", 12f, Color.parseColor("#9A9A9A")))
-        val r1 = row(); r1.addView(spacer(), LinearLayout.LayoutParams(0, 1, 1f)); btn(r1, "UP", false, 1f) { nudge("posY", -1) }
+        g2.addView(label("Tap an arrow to move 1 dp. Hold it to move fast. Go up until it sits on your camera.", 12f, Color.parseColor("#9A9A9A")))
+        val r1 = row(); r1.addView(spacer(), LinearLayout.LayoutParams(0, 1, 1f)); holdBtn(r1, "UP") { nudge("posY", -1) }
         r1.addView(spacer(), LinearLayout.LayoutParams(0, 1, 1f)); g2.addView(r1)
         val r2 = row()
-        btn(r2, "LEFT", false, 1f) { nudge("posX", -1) }
-        btn(r2, "RESET", false, 1f) { setVal("posX", 0); setVal("posY", 8) }
-        btn(r2, "RIGHT", false, 1f) { nudge("posX", 1) }
+        holdBtn(r2, "LEFT") { nudge("posX", -1) }
+        btn(r2, "RESET", false, 1f) { setVal("posX", 0); setVal("posY", 0) }
+        holdBtn(r2, "RIGHT") { nudge("posX", 1) }
         g2.addView(r2)
-        val r3 = row(); r3.addView(spacer(), LinearLayout.LayoutParams(0, 1, 1f)); btn(r3, "DOWN", false, 1f) { nudge("posY", 1) }
+        val r3 = row(); r3.addView(spacer(), LinearLayout.LayoutParams(0, 1, 1f)); holdBtn(r3, "DOWN") { nudge("posY", 1) }
         r3.addView(spacer(), LinearLayout.LayoutParams(0, 1, 1f)); g2.addView(r3)
         btn(g2, "SNAP TO CAMERA HEIGHT") { snapToCamera() }
         slider(g2, "Left / right", "posX", -200, 200, " dp")
-        slider(g2, "Up / down", "posY", 0, 100, " dp")
+        slider(g2, "Up / down", "posY", -40, 100, " dp")
 
         section("Look")
         val g3 = group()
