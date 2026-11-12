@@ -18,8 +18,10 @@ import android.graphics.PixelFormat
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioManager
 import android.media.MediaMetadata
 import android.media.session.MediaController
+import android.media.session.MediaSession
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.BatteryManager
@@ -42,6 +44,7 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import kotlin.math.abs
 import kotlin.random.Random
 
 class Card(
@@ -83,12 +86,12 @@ class IslandListener : NotificationListenerService() {
     private var idle: View? = null
     private var idleAnim: ObjectAnimator? = null
     private var tickRun: Runnable? = null
+    private var mediaRun: Runnable? = null
     private var currentKey = ""
     private var expanded = false
     private val stickies = LinkedHashMap<String, Card>()
-    private var controller: MediaController? = null
-    private var lastState = -1
-    private var lastTitle: String? = null
+    private val ctrls = HashMap<MediaSession.Token, Pair<MediaController, MediaController.Callback>>()
+    private val lastSig = HashMap<MediaSession.Token, String>()
     private val dismissRun = Runnable { dismiss() }
 
     companion object { var instance: IslandListener? = null }
@@ -96,6 +99,12 @@ class IslandListener : NotificationListenerService() {
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun wm() = getSystemService(WINDOW_SERVICE) as WindowManager
     private fun circle(c: Int) = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(c) }
+
+    /** Pure opaque black (or white) pill, no outline unless light style */
+    private fun pillBg(radius: Int) = GradientDrawable().apply {
+        setColor(Prefs.bg(this@IslandListener)); cornerRadius = dp(radius).toFloat()
+        if (Prefs.flag(this@IslandListener, "light", false)) setStroke(dp(1), Prefs.edge(this@IslandListener))
+    }
 
     private fun tick() {
         if (!Prefs.on(this, "haptic")) return
@@ -110,28 +119,45 @@ class IslandListener : NotificationListenerService() {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
             x = dp(Prefs.int(this@IslandListener, "posX"))
             y = dp(Prefs.int(this@IslandListener, "posY"))
+            alpha = 1f
             layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         }
     }
 
     // ---------- lifecycle ----------
     private val sessCb = MediaSessionManager.OnActiveSessionsChangedListener { attach(it) }
-    private val mcb = object : MediaController.Callback() {
-        override fun onMetadataChanged(m: MediaMetadata?) { maybeShowMedia() }
-        override fun onPlaybackStateChanged(s: PlaybackState?) { maybeShowMedia(); refreshIdle() }
-    }
-    private val powerRx = object : BroadcastReceiver() {
+
+    private val sysRx = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
-            if (!Prefs.on(c, "charge")) return
-            val b = c.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return
-            val pct = b.getIntExtra(BatteryManager.EXTRA_LEVEL, 0) * 100 / b.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
-            present(Card("charge", "CHARGING", "$pct%", "", null, null, battery = pct), false)
+            when (i.action) {
+                Intent.ACTION_POWER_CONNECTED, Intent.ACTION_BATTERY_LOW -> {
+                    if (!Prefs.on(c, "charge")) return
+                    val b = c.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return
+                    val pct = b.getIntExtra(BatteryManager.EXTRA_LEVEL, 0) * 100 / b.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+                    val low = i.action == Intent.ACTION_BATTERY_LOW
+                    present(Card("charge", if (low) "LOW BATTERY" else "CHARGING", "$pct%", "", null, null, battery = pct), false)
+                }
+                AudioManager.RINGER_MODE_CHANGED_ACTION -> {
+                    if (!Prefs.on(c, "ringer")) return
+                    val m = c.getSystemService(AudioManager::class.java).ringerMode
+                    val name = when (m) {
+                        AudioManager.RINGER_MODE_SILENT -> "SILENT"
+                        AudioManager.RINGER_MODE_VIBRATE -> "VIBRATE"
+                        else -> "RING"
+                    }
+                    present(Card("ringer", "SOUND", name, "", null, null), false)
+                }
+            }
         }
     }
 
     override fun onListenerConnected() {
         instance = this
-        registerReceiver(powerRx, IntentFilter(Intent.ACTION_POWER_CONNECTED))
+        val f = IntentFilter().apply {
+            addAction(Intent.ACTION_POWER_CONNECTED); addAction(Intent.ACTION_BATTERY_LOW)
+            addAction(AudioManager.RINGER_MODE_CHANGED_ACTION)
+        }
+        registerReceiver(sysRx, f)
         try {
             val msm = getSystemService(MediaSessionManager::class.java)
             val cn = ComponentName(this, IslandListener::class.java)
@@ -144,8 +170,10 @@ class IslandListener : NotificationListenerService() {
     override fun onListenerDisconnected() {
         instance = null
         removeIdle()
-        try { unregisterReceiver(powerRx) } catch (e: Exception) {}
+        try { unregisterReceiver(sysRx) } catch (e: Exception) {}
         try { getSystemService(MediaSessionManager::class.java).removeOnActiveSessionsChangedListener(sessCb) } catch (e: Exception) {}
+        ctrls.values.forEach { try { it.first.unregisterCallback(it.second) } catch (e: Exception) {} }
+        ctrls.clear(); lastSig.clear()
         removeNow()
     }
 
@@ -153,7 +181,19 @@ class IslandListener : NotificationListenerService() {
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         val n = sbn.notification
         if (sbn.packageName == packageName || (n.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
-        if (n.category == Notification.CATEGORY_TRANSPORT) return
+
+        // Music apps (Deezer etc.): grab the media session straight from the player notification
+        if (n.category == Notification.CATEGORY_TRANSPORT) {
+            try {
+                val tok = n.extras.getParcelable<MediaSession.Token>(Notification.EXTRA_MEDIA_SESSION)
+                if (tok != null) h.post {
+                    val c = MediaController(this, tok)
+                    watch(c); onMedia(c); refreshIdle()
+                }
+            } catch (e: Exception) {}
+            return
+        }
+
         val tag = when (n.category) {
             Notification.CATEGORY_CALL -> "CALL"
             Notification.CATEGORY_ALARM -> "ALARM"
@@ -178,28 +218,60 @@ class IslandListener : NotificationListenerService() {
         }
     }
 
-    // ---------- media ----------
-    private fun attach(list: List<MediaController>?) {
-        val c = list?.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING } ?: list?.firstOrNull()
-        if (c?.sessionToken == controller?.sessionToken) return
-        controller?.unregisterCallback(mcb)
-        controller = c
-        c?.registerCallback(mcb, h)
+    // ---------- media: watch EVERY player, not just one ----------
+    private fun watch(c: MediaController) {
+        val t = c.sessionToken
+        if (ctrls.containsKey(t)) return
+        val cb = object : MediaController.Callback() {
+            override fun onMetadataChanged(m: MediaMetadata?) { onMedia(c) }
+            override fun onPlaybackStateChanged(s: PlaybackState?) { onMedia(c); refreshIdle() }
+        }
+        c.registerCallback(cb, h)
+        ctrls[t] = Pair(c, cb)
     }
 
-    private fun maybeShowMedia() {
-        val c = controller ?: return
+    private fun attach(list: List<MediaController>?) {
+        (list ?: emptyList()).forEach { watch(it) }
+        refreshIdle()
+    }
+
+    private fun isPlaying(c: MediaController) = c.playbackState?.state == PlaybackState.STATE_PLAYING
+
+    private fun onMedia(c: MediaController) {
         val st = c.playbackState?.state ?: return
-        val title = c.metadata?.getString(MediaMetadata.METADATA_KEY_TITLE)
-        val changed = st != lastState || title != lastTitle
-        lastState = st; lastTitle = title
-        if (!changed || st != PlaybackState.STATE_PLAYING || title == null) return
+        val md = c.metadata
+        val title = md?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: md?.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE)
+        val sig = "$st|$title"
+        if (lastSig[c.sessionToken] == sig) return
+        lastSig[c.sessionToken] = sig
+        if (st != PlaybackState.STATE_PLAYING || title == null) return
         if (!Prefs.on(this, "media") || (currentKey == "media" && expanded)) return
-        val artist = c.metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
-        val bmp = c.metadata?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART) ?: c.metadata?.getBitmap(MediaMetadata.METADATA_KEY_ART)
+        // short wait so the new song's info has arrived, and no double pop-ups
+        mediaRun?.let { h.removeCallbacks(it) }
+        val r = Runnable { showMedia(c) }
+        mediaRun = r
+        h.postDelayed(r, 350)
+    }
+
+    private fun showMedia(c: MediaController): Boolean {
+        val md = c.metadata ?: return false
+        val title = md.getString(MediaMetadata.METADATA_KEY_TITLE) ?: md.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE) ?: return false
+        val artist = md.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: md.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST)
+            ?: md.getString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE) ?: ""
+        val bmp = md.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART) ?: md.getBitmap(MediaMetadata.METADATA_KEY_ART)
+            ?: md.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
         val art: Drawable? = bmp?.let { BitmapDrawable(resources, it) }
         present(Card("media", "NOW PLAYING", title, artist, art, c.sessionActivity, mc = c), false)
+        return true
     }
+
+    fun testMedia(): Boolean {
+        val all = ctrls.values.map { it.first }
+        val c = all.firstOrNull { isPlaying(it) } ?: all.firstOrNull() ?: return false
+        return showMedia(c)
+    }
+
+    fun mediaInfo(): String = if (ctrls.isEmpty()) "none seen yet" else ctrls.values.joinToString { it.first.packageName }
 
     // ---------- UI ----------
     fun test(exp: Boolean = false) =
@@ -222,10 +294,7 @@ class IslandListener : NotificationListenerService() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(10), dp(16), dp(10))
-            background = GradientDrawable().apply {
-                setColor(Prefs.bg(this@IslandListener)); cornerRadius = dp(34).toFloat(); setStroke(dp(1), edge)
-            }
-            elevation = dp(8).toFloat()
+            background = pillBg(34)
         }
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         card.icon?.let { ic ->
@@ -264,6 +333,7 @@ class IslandListener : NotificationListenerService() {
             }, LinearLayout.LayoutParams(0, -2, 1f))
 
         val mc = card.mc
+        val plain = card.key == "charge" || card.key == "ringer"
         if (exp && mc != null) {
             val dur = mc.metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
             if (dur > 0) {
@@ -291,14 +361,14 @@ class IslandListener : NotificationListenerService() {
             }
             val ctl = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
             action(ctl, "<<") { mc.transportControls.skipToPrevious() }
-            var playing = mc.playbackState?.state == PlaybackState.STATE_PLAYING
+            var playing = isPlaying(mc)
             action(ctl, if (playing) "PAUSE" else "PLAY") {
                 if (playing) mc.transportControls.pause() else mc.transportControls.play()
                 playing = !playing; it.text = if (playing) "PAUSE" else "PLAY"
             }
             action(ctl, ">>") { mc.transportControls.skipToNext() }
             root.addView(ctl)
-        } else if (exp && card.key != "charge") {
+        } else if (exp && !plain) {
             root.addView(View(this).apply { setBackgroundColor(edge) },
                 LinearLayout.LayoutParams(-1, dp(1)).apply { topMargin = dp(10) })
             val ctl = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -316,23 +386,26 @@ class IslandListener : NotificationListenerService() {
             }
             override fun onLongPress(e: MotionEvent) { tick(); h.post { present(card, true) } }
             override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+                val m = card.mc
+                if (m != null && abs(vx) > abs(vy) && abs(vx) > 800f) {   // swipe left / right = next / previous song
+                    if (vx < 0) m.transportControls.skipToNext() else m.transportControls.skipToPrevious()
+                    tick(); return true
+                }
                 if (vy < -400f) { stickies.remove(card.key); dismiss(); return true }
                 return false
             }
         })
         root.setOnTouchListener { _, ev -> gd.onTouchEvent(ev) }
 
+        // start tiny so nothing flashes, then grow out of the small pill (no fading, stays solid black)
+        root.scaleX = 0.01f; root.scaleY = 0.01f
         wm().addView(root, params(dp(Prefs.int(this, "width")), WindowManager.LayoutParams.WRAP_CONTENT, true))
         view = root
-
-        // grow out of the small pill like a real dynamic island
-        root.alpha = 0f
         root.post {
             root.pivotX = root.width / 2f; root.pivotY = 0f
             root.scaleX = dp(Prefs.int(this, "idleW")).toFloat() / root.width.coerceAtLeast(1)
             root.scaleY = dp(Prefs.int(this, "idleH")).toFloat() / root.height.coerceAtLeast(1)
-            root.alpha = 0.4f
-            root.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(450)
+            root.animate().scaleX(1f).scaleY(1f).setDuration(450)
                 .setInterpolator(OvershootInterpolator(0.9f)).start()
         }
         if (!card.sticky || exp) h.postDelayed(dismissRun, if (exp) 8000L else Prefs.int(this, "secs") * 1000L)
@@ -353,7 +426,8 @@ class IslandListener : NotificationListenerService() {
         if (v == null) { restore(); return }
         val sx = dp(Prefs.int(this, "idleW")).toFloat() / v.width.coerceAtLeast(1)
         val sy = dp(Prefs.int(this, "idleH")).toFloat() / v.height.coerceAtLeast(1)
-        v.animate().scaleX(sx).scaleY(sy).alpha(0f).setDuration(260).withEndAction {
+        val keepSolid = Prefs.on(this, "idle")
+        v.animate().scaleX(sx).scaleY(sy).alpha(if (keepSolid) 1f else 0f).setDuration(260).withEndAction {
             try { wm().removeView(v) } catch (e: Exception) {}
             if (view == null) restore()
         }.start()
@@ -377,14 +451,11 @@ class IslandListener : NotificationListenerService() {
         if (idle != null || view != null) return
         if (!Prefs.on(this, "idle") || !Settings.canDrawOverlays(this)) return
         val accent = Prefs.accent(this)
-        val playing = Prefs.on(this, "media") && controller?.playbackState?.state == PlaybackState.STATE_PLAYING
+        val playing = Prefs.on(this, "media") && ctrls.values.any { isPlaying(it.first) }
         val dot: View = if (playing) DotEq(this, accent) else View(this).apply { background = circle(accent) }
         val dsz = if (playing) dp(16) else dp(6)
         val pill = FrameLayout(this).apply {
-            background = GradientDrawable().apply {
-                setColor(Prefs.bg(this@IslandListener)); cornerRadius = dp(40).toFloat()
-                setStroke(dp(1), Prefs.edge(this@IslandListener))
-            }
+            background = pillBg(40)
             addView(dot, FrameLayout.LayoutParams(dsz, dsz, Gravity.END or Gravity.CENTER_VERTICAL).apply { marginEnd = dp(10) })
         }
         if (!playing) idleAnim = ObjectAnimator.ofFloat(dot, "alpha", 1f, 0.25f).apply {

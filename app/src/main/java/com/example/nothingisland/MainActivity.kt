@@ -26,6 +26,7 @@ class MainActivity : Activity() {
     private lateinit var f: Typeface
     private lateinit var stOverlay: TextView
     private lateinit var stNotif: TextView
+    private lateinit var stMusic: TextView
     private val red = Color.parseColor("#D71921")
     private val surface = Color.parseColor("#141414")
     private val sliders = HashMap<String, Pair<SeekBar, Int>>()
@@ -145,7 +146,8 @@ class MainActivity : Activity() {
         section("Setup")
         val g1 = group()
         stOverlay = label("", 13f, Color.WHITE); stNotif = label("", 13f, Color.WHITE)
-        g1.addView(stOverlay); g1.addView(stNotif)
+        stMusic = label("", 12f, Color.parseColor("#9A9A9A")).apply { setPadding(0, dp(4), 0, dp(4)) }
+        g1.addView(stOverlay); g1.addView(stNotif); g1.addView(stMusic)
         btn(g1, "ALLOW DISPLAY OVER APPS", true) {
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
         }
@@ -155,6 +157,11 @@ class MainActivity : Activity() {
         btn(tr, "TEST", false, 1f) { testIsland(false) }
         btn(tr, "TEST EXPANDED", false, 1f) { testIsland(true) }
         g1.addView(tr)
+        btn(g1, "TEST MUSIC") {
+            val s = IslandListener.instance
+            if (s == null) Toast.makeText(this, "Allow notification access first", Toast.LENGTH_SHORT).show()
+            else if (!s.testMedia()) Toast.makeText(this, "Play a song in your music app first", Toast.LENGTH_SHORT).show()
+        }
 
         section("Position")
         val g2 = group()
@@ -200,8 +207,9 @@ class MainActivity : Activity() {
         toggle(g4, "Notifications", "notif")
         toggle(g4, "Music + album art", "media")
         toggle(g4, "Calls, alarms, timers", "calls")
-        toggle(g4, "Charging", "charge")
-        g4.addView(label("Tap: open. Hold: expand. Swipe up: close.", 12f, Color.parseColor("#9A9A9A")).apply { setPadding(0, dp(12), 0, 0) })
+        toggle(g4, "Charging + low battery", "charge")
+        toggle(g4, "Ringer mode (silent / vibrate)", "ringer")
+        g4.addView(label("Tap: open. Hold: expand. Swipe up: close. Swipe left / right: skip songs.", 12f, Color.parseColor("#9A9A9A")).apply { setPadding(0, dp(12), 0, 0) })
 
         setContentView(ScrollView(this).apply { setBackgroundColor(Color.BLACK); addView(col) })
     }
@@ -216,6 +224,7 @@ class MainActivity : Activity() {
         }
         st(stOverlay, "Display over apps", ov)
         st(stNotif, "Notification access", nt)
+        stMusic.text = "Music apps seen: " + (IslandListener.instance?.mediaInfo() ?: "turn on notification access")
         IslandListener.instance?.refreshIdle()
     }
 }
