@@ -2,6 +2,7 @@ package com.example.nothingisland
 
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
+import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
 import android.app.Notification
 import android.app.PendingIntent
@@ -14,6 +15,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.media.MediaMetadata
@@ -23,14 +25,20 @@ import android.media.session.PlaybackState
 import android.os.BatteryManager
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.text.TextUtils
+import android.view.GestureDetector
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.animation.OvershootInterpolator
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -39,7 +47,7 @@ import kotlin.random.Random
 class Card(
     val key: String, val tag: String, val title: String, val text: String,
     val icon: Drawable?, val pi: PendingIntent?, val sticky: Boolean = false,
-    val mc: MediaController? = null, val battery: Int = -1
+    val mc: MediaController? = null, val battery: Int = -1, val tintIcon: Boolean = false
 )
 
 /** Dot-matrix equalizer */
@@ -73,6 +81,8 @@ class IslandListener : NotificationListenerService() {
     private val h = Handler(Looper.getMainLooper())
     private var view: View? = null
     private var idle: View? = null
+    private var idleAnim: ObjectAnimator? = null
+    private var tickRun: Runnable? = null
     private var currentKey = ""
     private var expanded = false
     private val stickies = LinkedHashMap<String, Card>()
@@ -86,6 +96,23 @@ class IslandListener : NotificationListenerService() {
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun wm() = getSystemService(WINDOW_SERVICE) as WindowManager
     private fun circle(c: Int) = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(c) }
+
+    private fun tick() {
+        if (!Prefs.on(this, "haptic")) return
+        try { getSystemService(Vibrator::class.java).vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK)) } catch (e: Exception) {}
+    }
+
+    private fun params(w: Int, hgt: Int, touchable: Boolean): WindowManager.LayoutParams {
+        var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+        if (!touchable) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        return WindowManager.LayoutParams(w, hgt, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, flags, PixelFormat.TRANSLUCENT).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            x = dp(Prefs.int(this@IslandListener, "posX"))
+            y = dp(Prefs.int(this@IslandListener, "posY"))
+            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        }
+    }
 
     // ---------- lifecycle ----------
     private val sessCb = MediaSessionManager.OnActiveSessionsChangedListener { attach(it) }
@@ -126,7 +153,7 @@ class IslandListener : NotificationListenerService() {
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         val n = sbn.notification
         if (sbn.packageName == packageName || (n.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
-        if (n.category == Notification.CATEGORY_TRANSPORT) return // media handled via sessions
+        if (n.category == Notification.CATEGORY_TRANSPORT) return
         val tag = when (n.category) {
             Notification.CATEGORY_CALL -> "CALL"
             Notification.CATEGORY_ALARM -> "ALARM"
@@ -138,8 +165,9 @@ class IslandListener : NotificationListenerService() {
         if (!Prefs.on(this, if (sticky) "calls" else "notif")) return
         val title = n.extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: return
         val text = n.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
-        val icon = try { packageManager.getApplicationIcon(sbn.packageName) } catch (e: Exception) { null }
-        val card = Card(sbn.key, tag, title, text, icon, n.contentIntent, sticky)
+        val large = try { n.getLargeIcon()?.loadDrawable(this) } catch (e: Exception) { null }
+        val small = try { n.getSmallIcon()?.loadDrawable(this) } catch (e: Exception) { null }
+        val card = Card(sbn.key, tag, title, text, large ?: small, n.contentIntent, sticky, tintIcon = large == null)
         h.post { if (sticky) stickies[sbn.key] = card; present(card, false) }
     }
 
@@ -168,11 +196,14 @@ class IslandListener : NotificationListenerService() {
         if (!changed || st != PlaybackState.STATE_PLAYING || title == null) return
         if (!Prefs.on(this, "media") || (currentKey == "media" && expanded)) return
         val artist = c.metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
-        present(Card("media", "NOW PLAYING", title, artist, null, c.sessionActivity, mc = c), false)
+        val bmp = c.metadata?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART) ?: c.metadata?.getBitmap(MediaMetadata.METADATA_KEY_ART)
+        val art: Drawable? = bmp?.let { BitmapDrawable(resources, it) }
+        present(Card("media", "NOW PLAYING", title, artist, art, c.sessionActivity, mc = c), false)
     }
 
     // ---------- UI ----------
-    fun test() = present(Card("test", "", "NOTHING ISLAND", "Tap to open. Hold to expand.", null, null), false)
+    fun test(exp: Boolean = false) =
+        present(Card("test", "TEST", "NOTHING ISLAND", "Tap to open. Hold to expand. Swipe up to close.", null, null), exp)
 
     private fun tv(t: String, sz: Float, color: Int, lines: Int) = TextView(this).apply {
         text = t; typeface = Prefs.font(this@IslandListener); setTextColor(color); textSize = sz
@@ -181,73 +212,117 @@ class IslandListener : NotificationListenerService() {
 
     private fun present(card: Card, exp: Boolean) {
         if (!Settings.canDrawOverlays(this)) return
-        removeIdle()
-        removeNow()
+        removeIdle(); removeNow()
         currentKey = card.key; expanded = exp
-        val accent = Prefs.accent(this)
+        val accent = Prefs.accent(this); val fg = Prefs.fg(this)
+        val dim = Prefs.dim(this); val off = Prefs.off(this); val edge = Prefs.edge(this)
+        if (card.tintIcon) card.icon?.mutate()?.setTint(fg)
+        if (!exp) tick()
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(10), dp(16), dp(10))
             background = GradientDrawable().apply {
-                setColor(Color.BLACK); cornerRadius = dp(34).toFloat(); setStroke(dp(1), Color.parseColor("#2A2A2A"))
+                setColor(Prefs.bg(this@IslandListener)); cornerRadius = dp(34).toFloat(); setStroke(dp(1), edge)
             }
             elevation = dp(8).toFloat()
         }
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        if (card.mc != null) {
-            row.addView(DotEq(this, accent), LinearLayout.LayoutParams(dp(26), dp(26)).apply { marginEnd = dp(12) })
-        } else if (card.icon != null) {
-            row.addView(ImageView(this).apply { setImageDrawable(card.icon) },
-                LinearLayout.LayoutParams(dp(30), dp(30)).apply { marginEnd = dp(12) })
+        card.icon?.let { ic ->
+            row.addView(ImageView(this).apply {
+                setImageDrawable(ic); scaleType = ImageView.ScaleType.CENTER_CROP
+                background = GradientDrawable().apply { setColor(Prefs.surface(this@IslandListener)); cornerRadius = dp(9).toFloat() }
+                clipToOutline = true
+                if (card.tintIcon) setPadding(dp(5), dp(5), dp(5), dp(5))
+            }, LinearLayout.LayoutParams(dp(32), dp(32)).apply { marginEnd = dp(12) })
         }
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         if (card.tag.isNotEmpty()) col.addView(tv(card.tag, 10f, accent, 1))
-        col.addView(tv(card.title.uppercase(), 13f, Color.WHITE, 1))
-        if (card.text.isNotEmpty()) col.addView(tv(card.text, 12f, Color.parseColor("#9A9A9A"), if (exp) 4 else 1))
+        col.addView(tv(card.title.uppercase(), 13f, fg, 1))
+        if (card.text.isNotEmpty()) col.addView(tv(card.text, 12f, dim, if (exp) 4 else 1))
         row.addView(col, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        row.addView(View(this).apply { background = circle(accent) },
-            LinearLayout.LayoutParams(dp(8), dp(8)).apply { marginStart = dp(10) })
+        if (card.mc != null) {
+            row.addView(DotEq(this, accent), LinearLayout.LayoutParams(dp(24), dp(24)).apply { marginStart = dp(10) })
+        } else {
+            row.addView(View(this).apply { background = circle(accent) },
+                LinearLayout.LayoutParams(dp(8), dp(8)).apply { marginStart = dp(10) })
+        }
         root.addView(row)
 
         if (card.battery >= 0) {
             val bar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
             for (i in 0 until 20) bar.addView(View(this).apply {
-                background = circle(if (i < card.battery / 5) accent else Color.parseColor("#333333"))
+                background = circle(if (i < card.battery / 5) accent else off)
             }, LinearLayout.LayoutParams(dp(6), dp(6)).apply { marginEnd = dp(3) })
             root.addView(bar, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(8) })
         }
+
+        fun action(parent: LinearLayout, label: String, onClick: (TextView) -> Unit) = parent.addView(
+            tv(label, 13f, fg, 1).apply {
+                gravity = Gravity.CENTER; setPadding(0, dp(10), 0, dp(4))
+                setOnClickListener { onClick(this) }
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+
         val mc = card.mc
         if (exp && mc != null) {
+            val dur = mc.metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
+            if (dur > 0) {
+                val dots = ArrayList<View>()
+                val prog = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                for (i in 0 until 24) {
+                    val d = View(this)
+                    dots.add(d)
+                    prog.addView(d, LinearLayout.LayoutParams(dp(5), dp(5)).apply { marginEnd = dp(3) })
+                }
+                root.addView(prog, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(10) })
+                val r = object : Runnable {
+                    override fun run() {
+                        val ps = mc.playbackState ?: return
+                        var pos = ps.position
+                        if (ps.state == PlaybackState.STATE_PLAYING)
+                            pos += ((SystemClock.elapsedRealtime() - ps.lastPositionUpdateTime) * ps.playbackSpeed).toLong()
+                        val lit = ((pos.toFloat() / dur) * 24).toInt().coerceIn(0, 24)
+                        for (i in 0 until 24) dots[i].background = circle(if (i < lit) accent else off)
+                        h.postDelayed(this, 1000)
+                    }
+                }
+                tickRun = r
+                r.run()
+            }
             val ctl = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-            fun b(label: String, onClick: (TextView) -> Unit) = ctl.addView(
-                tv(label, 13f, Color.WHITE, 1).apply {
-                    gravity = Gravity.CENTER; setPadding(0, dp(12), 0, dp(6))
-                    setOnClickListener { onClick(this) }
-                }, LinearLayout.LayoutParams(0, -2, 1f))
-            b("<<") { mc.transportControls.skipToPrevious() }
+            action(ctl, "<<") { mc.transportControls.skipToPrevious() }
             var playing = mc.playbackState?.state == PlaybackState.STATE_PLAYING
-            b(if (playing) "PAUSE" else "PLAY") {
+            action(ctl, if (playing) "PAUSE" else "PLAY") {
                 if (playing) mc.transportControls.pause() else mc.transportControls.play()
                 playing = !playing; it.text = if (playing) "PAUSE" else "PLAY"
             }
-            b(">>") { mc.transportControls.skipToNext() }
+            action(ctl, ">>") { mc.transportControls.skipToNext() }
+            root.addView(ctl)
+        } else if (exp && card.key != "charge") {
+            root.addView(View(this).apply { setBackgroundColor(edge) },
+                LinearLayout.LayoutParams(-1, dp(1)).apply { topMargin = dp(10) })
+            val ctl = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            action(ctl, "OPEN") { try { card.pi?.send() } catch (e: Exception) {}; if (!card.sticky) dismiss() }
+            action(ctl, "CLOSE") { stickies.remove(card.key); dismiss() }
             root.addView(ctl)
         }
 
-        root.setOnClickListener {
-            try { card.pi?.send() } catch (e: Exception) {}
-            if (!card.sticky) dismiss()
-        }
-        root.setOnLongClickListener { h.post { present(card, true) }; true }
+        val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean = true
+            override fun onSingleTapUp(e: MotionEvent): Boolean {
+                try { card.pi?.send() } catch (ex: Exception) {}
+                if (!card.sticky) dismiss()
+                return true
+            }
+            override fun onLongPress(e: MotionEvent) { tick(); h.post { present(card, true) } }
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+                if (vy < -400f) { stickies.remove(card.key); dismiss(); return true }
+                return false
+            }
+        })
+        root.setOnTouchListener { _, ev -> gd.onTouchEvent(ev) }
 
-        val lp = WindowManager.LayoutParams(
-            dp(Prefs.int(this, "width")), WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL; y = topY(); x = topX(); layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS }
-        wm().addView(root, lp)
+        wm().addView(root, params(dp(Prefs.int(this, "width")), WindowManager.LayoutParams.WRAP_CONTENT, true))
         view = root
 
         root.pivotY = 0f
@@ -258,48 +333,35 @@ class IslandListener : NotificationListenerService() {
         if (!card.sticky || exp) h.postDelayed(dismissRun, if (exp) 8000L else Prefs.int(this, "secs") * 1000L)
     }
 
+    private fun stopTick() { tickRun?.let { h.removeCallbacks(it) }; tickRun = null }
+
     private fun removeNow() {
-        h.removeCallbacks(dismissRun)
+        h.removeCallbacks(dismissRun); stopTick()
         view?.let { try { wm().removeView(it) } catch (e: Exception) {} }
         view = null; currentKey = ""; expanded = false
     }
 
     private fun dismiss() {
-        h.removeCallbacks(dismissRun)
+        h.removeCallbacks(dismissRun); stopTick()
         val v = view
         view = null; currentKey = ""; expanded = false
-        if (v == null) { showSticky(); return }
+        if (v == null) { restore(); return }
         v.animate().scaleX(0.25f).scaleY(0.5f).alpha(0f).setDuration(200).withEndAction {
             try { wm().removeView(v) } catch (e: Exception) {}
-            if (view == null) showSticky()
+            if (view == null) restore()
         }.start()
     }
 
-    private fun showSticky() {
+    private fun restore() {
         val c = stickies.values.lastOrNull()
         if (c != null) present(c, false) else showIdle()
     }
 
-    /** Find the camera hole so the island lines up with it */
-    private fun cutout(): android.graphics.Rect? = try {
-        wm().currentWindowMetrics.windowInsets.displayCutout?.boundingRects?.firstOrNull()
-    } catch (e: Exception) { null }
-
-    private fun topY(): Int {
-        val c = cutout()
-        val base = if (c != null) c.centerY() - dp(12) else dp(10)
-        return base + dp(Prefs.int(this, "nudge"))
-    }
-
-    private fun topX(): Int {
-        val c = cutout() ?: return 0
-        return try { c.centerX() - wm().currentWindowMetrics.bounds.width() / 2 } catch (e: Exception) { 0 }
-    }
-
-    /** Small always-on pill around the camera */
+    // ---------- always-on small pill ----------
     fun refreshIdle() { h.post { removeIdle(); if (view == null) showIdle() } }
 
     private fun removeIdle() {
+        idleAnim?.cancel(); idleAnim = null
         idle?.let { try { wm().removeView(it) } catch (e: Exception) {} }
         idle = null
     }
@@ -307,20 +369,20 @@ class IslandListener : NotificationListenerService() {
     private fun showIdle() {
         if (idle != null || view != null) return
         if (!Prefs.on(this, "idle") || !Settings.canDrawOverlays(this)) return
-        val pill = android.widget.FrameLayout(this).apply {
+        val dot = View(this).apply { background = circle(Prefs.accent(this@IslandListener)) }
+        val pill = FrameLayout(this).apply {
             background = GradientDrawable().apply {
-                setColor(Color.BLACK); cornerRadius = dp(40).toFloat(); setStroke(dp(1), Color.parseColor("#2A2A2A"))
+                setColor(Prefs.bg(this@IslandListener)); cornerRadius = dp(40).toFloat()
+                setStroke(dp(1), Prefs.edge(this@IslandListener))
             }
-            addView(View(this@IslandListener).apply { background = circle(Prefs.accent(this@IslandListener)) },
-                android.widget.FrameLayout.LayoutParams(dp(6), dp(6), Gravity.END or Gravity.CENTER_VERTICAL).apply { marginEnd = dp(10) })
+            addView(dot, FrameLayout.LayoutParams(dp(6), dp(6), Gravity.END or Gravity.CENTER_VERTICAL).apply { marginEnd = dp(10) })
         }
-        val lp = WindowManager.LayoutParams(
-            dp(Prefs.int(this, "idleW")), dp(24),
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL; y = topY(); x = topX(); layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS }
-        try { wm().addView(pill, lp); idle = pill } catch (e: Exception) {}
+        idleAnim = ObjectAnimator.ofFloat(dot, "alpha", 1f, 0.25f).apply {
+            duration = 1400; repeatMode = ValueAnimator.REVERSE; repeatCount = ValueAnimator.INFINITE; start()
+        }
+        try {
+            wm().addView(pill, params(dp(Prefs.int(this, "idleW")), dp(Prefs.int(this, "idleH")), false))
+            idle = pill
+        } catch (e: Exception) { idleAnim?.cancel(); idleAnim = null }
     }
 }
