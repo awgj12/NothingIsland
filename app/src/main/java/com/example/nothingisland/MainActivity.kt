@@ -27,9 +27,12 @@ class MainActivity : Activity() {
     private lateinit var stOverlay: TextView
     private lateinit var stNotif: TextView
     private lateinit var stMusic: TextView
+    private lateinit var appsBox: LinearLayout
     private val red = Color.parseColor("#D71921")
+    private val grey = Color.parseColor("#9A9A9A")
     private val surface = Color.parseColor("#141414")
     private val sliders = HashMap<String, Pair<SeekBar, Int>>()
+    private val hh = Handler(Looper.getMainLooper())
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     private fun label(t: String, sz: Float, color: Int) = TextView(this).apply {
@@ -44,6 +47,8 @@ class MainActivity : Activity() {
         orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(12), dp(16), dp(14))
         background = GradientDrawable().apply { setColor(surface); cornerRadius = dp(22).toFloat() }
     }.also { col.addView(it, LinearLayout.LayoutParams(-1, -2)) }
+
+    private fun hint(p: LinearLayout, t: String) = p.addView(label(t, 12f, grey).apply { setPadding(0, dp(4), 0, dp(4)) })
 
     private fun btn(p: LinearLayout, t: String, primary: Boolean = false, weight: Float = 0f, onClick: () -> Unit): Button {
         val b = Button(this).apply {
@@ -60,8 +65,6 @@ class MainActivity : Activity() {
         return b
     }
 
-    private val hh = Handler(Looper.getMainLooper())
-
     /** Button that keeps repeating while you hold it */
     private fun holdBtn(p: LinearLayout, t: String, act: () -> Unit) {
         val b = btn(p, t, false, 1f) {}
@@ -70,7 +73,7 @@ class MainActivity : Activity() {
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     act()
-                    val r = object : Runnable { override fun run() { act(); hh.postDelayed(this, 50) } }
+                    val r = object : Runnable { override fun run() { act(); hh.postDelayed(this, 45) } }
                     rep = r; hh.postDelayed(r, 350)
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { rep?.let { hh.removeCallbacks(it) }; rep = null }
@@ -90,7 +93,11 @@ class MainActivity : Activity() {
             override fun onProgressChanged(s: SeekBar?, v: Int, u: Boolean) {
                 Prefs.sp(this@MainActivity).edit().putInt(key, v + min).apply()
                 t.text = "$name: ${v + min}$unit"
-                IslandListener.instance?.refreshIdle()
+                val svc = IslandListener.instance
+                when (key) {
+                    "posX", "posY", "idleW", "liveW" -> svc?.moveIdle()
+                    "idleH", "liveH" -> svc?.refreshIdle()
+                }
             }
             override fun onStartTrackingTouch(s: SeekBar?) {}
             override fun onStopTrackingTouch(s: SeekBar?) {}
@@ -106,47 +113,63 @@ class MainActivity : Activity() {
 
     private fun nudge(key: String, d: Int) = setVal(key, Prefs.int(this, key) + d)
 
-    private fun toggle(p: LinearLayout, name: String, key: String, def: Boolean = true) = p.addView(Switch(this).apply {
-        text = name; setTextColor(Color.WHITE); typeface = f
-        isChecked = Prefs.flag(this@MainActivity, key, def)
-        thumbTintList = ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
-            intArrayOf(red, Color.GRAY))
+    private fun sw(name: String, checked: Boolean, onChange: (Boolean) -> Unit) = Switch(this).apply {
+        text = name; setTextColor(Color.WHITE); typeface = f; isChecked = checked
+        thumbTintList = ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()), intArrayOf(red, Color.GRAY))
         trackTintList = ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
             intArrayOf(Color.parseColor("#5A0A0E"), Color.parseColor("#333333")))
-        setOnCheckedChangeListener { _, on ->
-            Prefs.sp(this@MainActivity).edit().putBoolean(key, on).apply()
-            IslandListener.instance?.refreshIdle()
-        }
-    }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        setOnCheckedChangeListener { _, on -> onChange(on) }
+    }
+
+    private fun toggle(p: LinearLayout, name: String, key: String, def: Boolean = true) = p.addView(
+        sw(name, Prefs.flag(this, key, def)) { on ->
+            Prefs.sp(this).edit().putBoolean(key, on).apply(); IslandListener.instance?.refreshIdle()
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
 
     private fun spacer() = View(this)
     private fun row(): LinearLayout = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
 
+    private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
+
     private fun testIsland(exp: Boolean) {
         val s = IslandListener.instance
-        if (s == null) Toast.makeText(this, "Allow notification access first", Toast.LENGTH_SHORT).show() else s.test(exp)
+        if (s == null) toast("Allow notification access first") else s.test(exp)
     }
 
     private fun snapToCamera() {
         val r = try { windowManager.currentWindowMetrics.windowInsets.displayCutout?.boundingRects?.firstOrNull() } catch (e: Exception) { null }
-        if (r == null) {
-            Toast.makeText(this, "Camera not detected. Use the arrows.", Toast.LENGTH_SHORT).show(); return
-        }
+        if (r == null) { toast("Camera not detected. Use the arrows."); return }
         val d = resources.displayMetrics.density
         setVal("posY", Math.round(r.centerY() / d - Prefs.int(this, "idleH") / 2f))
+    }
+
+    /** Apps that have sent a notification. Switch one off to mute it. */
+    private fun fillApps() {
+        appsBox.removeAllViews()
+        val seen = (Prefs.sp(this).getStringSet("seen", null) ?: emptySet()).sorted()
+        if (seen.isEmpty()) { hint(appsBox, "Apps show up here after they send a notification."); return }
+        for (pkg in seen) {
+            val name = try { packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString() } catch (e: Exception) { pkg }
+            appsBox.addView(sw(name, pkg !in Prefs.muted(this)) { on ->
+                val m = HashSet<String>(Prefs.muted(this))
+                if (on) m.remove(pkg) else m.add(pkg)
+                Prefs.sp(this).edit().putStringSet("muted", m).apply()
+            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        }
     }
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         f = Prefs.font(this)
-        col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(56), dp(20), dp(80)) }
+        col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(56), dp(20), dp(90)) }
         col.addView(label("NOTHING ISLAND", 28f, Color.WHITE))
-        col.addView(label("dynamic island, nothing style", 12f, Color.parseColor("#9A9A9A")))
+        col.addView(label("dynamic island, nothing style", 12f, grey))
 
+        // ---------- SETUP ----------
         section("Setup")
         val g1 = group()
         stOverlay = label("", 13f, Color.WHITE); stNotif = label("", 13f, Color.WHITE)
-        stMusic = label("", 12f, Color.parseColor("#9A9A9A")).apply { setPadding(0, dp(4), 0, dp(4)) }
+        stMusic = label("", 12f, grey).apply { setPadding(0, dp(4), 0, dp(4)) }
         g1.addView(stOverlay); g1.addView(stNotif); g1.addView(stMusic)
         btn(g1, "ALLOW DISPLAY OVER APPS", true) {
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
@@ -159,13 +182,14 @@ class MainActivity : Activity() {
         g1.addView(tr)
         btn(g1, "TEST MUSIC") {
             val s = IslandListener.instance
-            if (s == null) Toast.makeText(this, "Allow notification access first", Toast.LENGTH_SHORT).show()
-            else if (!s.testMedia()) Toast.makeText(this, "Play a song in your music app first", Toast.LENGTH_SHORT).show()
+            if (s == null) toast("Allow notification access first")
+            else if (!s.testMusicSafe()) toast("Play a song in your music app first")
         }
 
-        section("Position")
+        // ---------- PILL POSITION ----------
+        section("Pill position")
         val g2 = group()
-        g2.addView(label("Tap an arrow to move 1 dp. Hold it to move fast. Go up until it sits on your camera.", 12f, Color.parseColor("#9A9A9A")))
+        hint(g2, "Tap an arrow to move 1 dp. Hold it to move fast.")
         val r1 = row(); r1.addView(spacer(), LinearLayout.LayoutParams(0, 1, 1f)); holdBtn(r1, "UP") { nudge("posY", -1) }
         r1.addView(spacer(), LinearLayout.LayoutParams(0, 1, 1f)); g2.addView(r1)
         val r2 = row()
@@ -176,23 +200,44 @@ class MainActivity : Activity() {
         val r3 = row(); r3.addView(spacer(), LinearLayout.LayoutParams(0, 1, 1f)); holdBtn(r3, "DOWN") { nudge("posY", 1) }
         r3.addView(spacer(), LinearLayout.LayoutParams(0, 1, 1f)); g2.addView(r3)
         btn(g2, "SNAP TO CAMERA HEIGHT") { snapToCamera() }
-        slider(g2, "Left / right", "posX", -200, 200, " dp")
-        slider(g2, "Up / down", "posY", -40, 100, " dp")
+        slider(g2, "Left / right", "posX", -300, 300, " dp")
+        slider(g2, "Up / down", "posY", -60, 200, " dp")
 
-        section("Look")
+        // ---------- PILL SIZE ----------
+        section("Pill size")
         val g3 = group()
-        toggle(g3, "Always-on small pill", "idle")
-        toggle(g3, "Light style (white)", "light", false)
-        toggle(g3, "Haptic tick", "haptic")
+        toggle(g3, "Always-on pill", "idle")
         toggle(g3, "Accent dot on idle pill", "dot")
-        slider(g3, "Idle pill width", "idleW", 50, 200, " dp")
-        slider(g3, "Live pill width (music, calls)", "liveW", 100, 320, " dp")
-        slider(g3, "Pill height", "idleH", 16, 48, " dp")
-        slider(g3, "Expanded width", "width", 220, 380, " dp")
-        slider(g3, "Show time", "secs", 2, 10, " s")
-        g3.addView(label("Accent color", 13f, Color.WHITE).apply { setPadding(0, dp(14), 0, dp(6)) })
+        hint(g3, "Idle = nothing happening. Live = music, calls, timers (camera sits in the gap).")
+        slider(g3, "Idle width", "idleW", 30, 300, " dp")
+        slider(g3, "Idle height", "idleH", 10, 70, " dp")
+        slider(g3, "Live width", "liveW", 60, 400, " dp")
+        slider(g3, "Live height", "liveH", 10, 80, " dp")
+
+        // ---------- BANNER ----------
+        section("Banner (notifications)")
+        val g4 = group()
+        val br = row()
+        btn(br, "TEST", false, 1f) { testIsland(false) }
+        btn(br, "EXPANDED", false, 1f) { testIsland(true) }
+        g4.addView(br)
+        slider(g4, "Width", "width", 150, 420, " dp")
+        slider(g4, "Corner roundness", "radius", 4, 60, " dp")
+        slider(g4, "Space above content", "bannerTop", 0, 100, " dp")
+        slider(g4, "Text size", "textScale", 60, 180, " %")
+        slider(g4, "Icon size", "iconSize", 20, 72, " dp")
+        slider(g4, "Left / right", "bannerX", -200, 200, " dp")
+        slider(g4, "Up / down", "bannerY", -60, 200, " dp")
+        slider(g4, "Show time", "secs", 1, 15, " s")
+
+        // ---------- STYLE ----------
+        section("Style")
+        val g5 = group()
+        toggle(g5, "Light style (white)", "light", false)
+        toggle(g5, "Haptic tick", "haptic")
+        g5.addView(label("Accent color", 13f, Color.WHITE).apply { setPadding(0, dp(14), 0, dp(6)) })
         val cr = row()
-        listOf(0xFFD71921, 0xFFFFFFFF, 0xFF00C853, 0xFFFFD600, 0xFF2979FF).forEach { l ->
+        listOf(0xFFD71921, 0xFFFFFFFF, 0xFF00C853, 0xFFFFD600, 0xFF2979FF, 0xFFFF6D00, 0xFFD500F9).forEach { l ->
             val c = l.toInt()
             cr.addView(View(this).apply {
                 background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(c) }
@@ -200,18 +245,38 @@ class MainActivity : Activity() {
                     Prefs.sp(this@MainActivity).edit().putInt("accent", c).apply()
                     IslandListener.instance?.refreshIdle()
                 }
-            }, LinearLayout.LayoutParams(dp(36), dp(36)).apply { marginEnd = dp(12) })
+            }, LinearLayout.LayoutParams(dp(34), dp(34)).apply { marginEnd = dp(10) })
         }
-        g3.addView(cr)
+        g5.addView(cr)
 
+        // ---------- FEATURES ----------
         section("Features")
-        val g4 = group()
-        toggle(g4, "Notifications", "notif")
-        toggle(g4, "Music + album art", "media")
-        toggle(g4, "Calls, alarms, timers", "calls")
-        toggle(g4, "Charging + low battery", "charge")
-        toggle(g4, "Ringer mode (silent / vibrate)", "ringer")
-        g4.addView(label("Tap: open. Hold: expand. Swipe up: close. Swipe left / right: skip songs.", 12f, Color.parseColor("#9A9A9A")).apply { setPadding(0, dp(12), 0, 0) })
+        val g6 = group()
+        toggle(g6, "Notifications (every app)", "notif")
+        toggle(g6, "Ongoing notifications", "ongoing")
+        toggle(g6, "Music + album art", "media")
+        toggle(g6, "Calls, alarms, timers", "calls")
+        toggle(g6, "Charging + low battery", "charge")
+        toggle(g6, "Ringer mode (silent / vibrate)", "ringer")
+        hint(g6, "Tap: open. Hold: expand. Swipe up: close. Swipe left / right: skip songs.")
+
+        // ---------- APPS ----------
+        section("Apps")
+        appsBox = group()
+
+        // ---------- RESET ----------
+        section("Reset")
+        val g7 = group()
+        btn(g7, "RESET ALL SIZES AND POSITIONS") {
+            val seen = Prefs.sp(this).getStringSet("seen", null)
+            val muted = Prefs.sp(this).getStringSet("muted", null)
+            val e = Prefs.sp(this).edit().clear()
+            if (seen != null) e.putStringSet("seen", HashSet<String>(seen))
+            if (muted != null) e.putStringSet("muted", HashSet<String>(muted))
+            e.apply()
+            IslandListener.instance?.refreshIdle()
+            recreate()
+        }
 
         setContentView(ScrollView(this).apply { setBackgroundColor(Color.BLACK); addView(col) })
     }
@@ -227,6 +292,7 @@ class MainActivity : Activity() {
         st(stOverlay, "Display over apps", ov)
         st(stNotif, "Notification access", nt)
         stMusic.text = "Music apps seen: " + (IslandListener.instance?.mediaInfo() ?: "turn on notification access")
+        fillApps()
         IslandListener.instance?.refreshIdle()
     }
 }
